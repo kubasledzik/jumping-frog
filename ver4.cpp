@@ -5,7 +5,6 @@
 #include <cstring>
 #include <stdio.h>
 
-
 #define MAX_NUM 70
 #define DELAY_CHANGE_T 4000     //a car changes its delay after 4-8 seconds (picked randomly)
 #define CAR_HEIGHT 2
@@ -13,28 +12,19 @@
 #define MAX_LINE_LENGTH 200
 #define PROXIMITY 2    //if the frog is this distance from a car, provided the car is neutral, it will stop
 #define INVINCIBILITY_TIME 500 //frog is immortal after getting out of a car
+#define LEADERBOARD_FILE "leaderboard.txt"
 
 typedef struct {
     char file_name[30];
     int car_number;
     int road_lanes;
     int min_car_delay, max_car_delay;
-
     int width;
     int height;
     char board[MAX_NUM][MAX_NUM];
+    int f_car_chance;
+    int n_car_chance;
 } GameConfig;
-
-typedef struct {
-    int x, y;
-    char direction;
-    int moves;
-    int last_jump_time;
-    int jump_delay;
-    bool is_carried;
-    bool is_invincible; //up to 0.5 seconds after getting out of a car the frog is "immortal" and can't die (so it can move away from the road)
-    clock_t invincibility_start;
-} Frog;
 
 typedef struct {
     int x, y;
@@ -50,15 +40,35 @@ typedef struct {
     clock_t until_delay_change;
 } Car;
 
+typedef struct {
+    int x, y;
+    char direction;
+    int moves;
+    int last_jump_time;
+    int jump_delay;
+    bool is_carried;
+    bool is_invincible; //up to 0.5 seconds after getting out of a car the frog is "immortal" and can't die (so it can move away from the road)
+    clock_t invincibility_start;
+    int score;
+    Car *frogs_car;
+} Frog;
+
+typedef struct {
+    int x, y;
+    int dir_x, dir_y;
+    int delay;
+    clock_t last_move_time;
+    bool alive;
+} Stork;
+
 
 void delay(int mseconds) {
     clock_t start_time = clock();
     while (clock() < start_time + mseconds * CLOCKS_PER_SEC / 1000);
 }
 
-
-//GETTING PARAMETERS FROM THE CONFIG FILE, PREPARING THE GAME
-
+//FILE RELATED SECTION:
+        //GETTING PARAMETERS FROM THE CONFIG FILE, PREPARING THE GAME
 FILE* open_config(GameConfig *game_config){
     FILE *file = fopen(game_config->file_name, "r");
     if(!file){
@@ -67,11 +77,18 @@ FILE* open_config(GameConfig *game_config){
     return file;
 }
 
-bool parse_basic_data(char buffer[], GameConfig *game_config, Frog *frog){
+bool parse_basic_data(char buffer[], GameConfig *game_config, Frog *frog, Stork *stork){
+    int temp;
     if (sscanf(buffer, "jump_delay=%d", &frog->jump_delay) == 1) {
         return true;
     }
     if (sscanf(buffer, "road_lanes=%d", &game_config->road_lanes) == 1){ 
+        return true;
+    }
+    if (sscanf(buffer, "n_car_chance=%d", &game_config->f_car_chance) == 1){
+        return true;
+    }
+    if (sscanf(buffer, "f_car_chance=%d", &game_config->n_car_chance) == 1){
         return true;
     }
     if (sscanf(buffer, "car_number=%d", &game_config->car_number) == 1){
@@ -81,6 +98,15 @@ bool parse_basic_data(char buffer[], GameConfig *game_config, Frog *frog){
         return true;
     }
     if (sscanf(buffer, "height=%d", &game_config->height) == 1){ 
+        return true;
+    }
+    if (sscanf(buffer, "stork_alive=%d", &temp) == 1){ 
+        if(temp == 1){
+            stork->alive = true;
+        }
+        else{
+            stork->alive = false;
+        }
         return true;
     }
     if (sscanf(buffer, "min_car_delay=%d", &game_config->min_car_delay) == 1) {
@@ -107,7 +133,7 @@ bool parse_seed(FILE *file, char buffer[], GameConfig *game_config){
     return true;
 }
 
-bool get_data(GameConfig *game_config, Frog *frog, FILE* file){
+bool get_data(GameConfig *game_config, Frog *frog, FILE* file, Stork *stork){
     char buffer[MAX_LINE_LENGTH];
     bool is_seed_found = false;
 
@@ -116,11 +142,13 @@ bool get_data(GameConfig *game_config, Frog *frog, FILE* file){
             continue;
         }
 
-        if (parse_basic_data(buffer, game_config, frog)) continue;
+        if (parse_basic_data(buffer, game_config, frog, stork)) continue;
 
         if (strncmp(buffer, "seed=", 5) == 0) {
             is_seed_found = true;
-            if (parse_seed(file, buffer, game_config) == false) return false;
+            if (parse_seed(file, buffer, game_config) == false){
+                 return false;
+            }
         }
     }
 
@@ -130,10 +158,10 @@ bool get_data(GameConfig *game_config, Frog *frog, FILE* file){
     }
     return true;
 }
-bool read_config(GameConfig *game_config, Frog *frog){
+bool read_config(GameConfig *game_config, Frog *frog, Stork *stork){
     FILE *file = open_config(game_config);
 
-    if(get_data(game_config, frog, file) == false){
+    if(get_data(game_config, frog, file, stork) == false){
         fclose(file);
         return false;
     }
@@ -142,8 +170,161 @@ bool read_config(GameConfig *game_config, Frog *frog){
     return true;
 }
 
-// INITIALIZING THE FROG
+        //LEADERBOARD RELATED FUNCTIONS
+void calculate_score(int time_elapsed, Frog *frog) {
+    int base_score = 1000;            
+    int time_penalty = time_elapsed * 10; 
+    int move_penalty = frog->moves * 5;       
 
+    frog->score = base_score - time_penalty - move_penalty;
+    if (frog->score < 0) frog->score = 0;
+}
+
+void save_score(const char* player_name, int score) {
+    FILE *file = fopen(LEADERBOARD_FILE, "a");
+    if (!file) {
+        std::cerr << "Something's wrong with the leaderboard file.\n";
+        return;
+    }
+    fprintf(file, "%s - %d points.\n", player_name, score);
+    fclose(file);
+}
+
+void print_ranking(int length, int score[], char name[][MAX_NUM], int sorted_indexes[]) {
+    int pos = 6;
+    clear();
+    mvprintw(5, 10, "___=== Game Ranking ===___");
+    for(int i = 0; i < length; i++){
+        mvprintw(pos++, 10, "%d.) %s - %d points.", i + 1, name[sorted_indexes[i]], score[sorted_indexes[i]]);
+    }
+    mvprintw(pos + 2, 10, "Press anything to get back to the main menu.");
+    refresh();
+}
+
+void sort_ranking_data(int length, char name[][MAX_NUM], int score[], int sorted_indexes[]){
+    for(int i = 0; i < length; i++){
+        sorted_indexes[i] = i;
+    }
+
+    for(int i = 0; i < length; i++){
+        for(int j = 1; j < length; j++){
+            if(score[sorted_indexes[j]] > score[sorted_indexes[j - 1]]){
+                int temp = sorted_indexes[j];
+                sorted_indexes[j] = sorted_indexes[j - 1];
+                sorted_indexes[j - 1] = temp;
+            }
+        }
+    }
+}
+
+void show_ranking() {
+    FILE *file = fopen(LEADERBOARD_FILE, "r");
+    if (!file) {
+        std::cerr << "Something's wrong with the leaderboard file.\n";
+        return;
+    }
+
+    char name[MAX_NUM][MAX_NUM]; //creates arrays that are to be sorted based on points
+    int score[MAX_NUM];
+    int length = 0;
+
+    //data from file will be temporarily saved here
+    char temp_name[MAX_NUM];
+    int temp_score;
+    while ((fscanf(file, "%s - %d points.", temp_name, &temp_score) == 2) && length < MAX_NUM) { 
+        strcpy(name[length], temp_name);
+        score[length] = temp_score;
+        length++;
+    }
+
+    int *sorted_indexes = new int[length];
+    sort_ranking_data(length, name, score, sorted_indexes);
+    print_ranking(length, score, name, sorted_indexes);
+    delete[] sorted_indexes;
+   
+    fclose(file);
+}
+
+void get_player_name(Frog *frog, char name[]) {
+    mvprintw(3, 3, "Congratulations! You got: %d points.", frog->score);
+    mvprintw(4, 5, "Enter your name:");
+    echo();
+    getnstr(name, MAX_NUM - 1); 
+    noecho();
+}
+
+//INITIALIZING THE STORK
+void init_stork(GameConfig *game_config, Stork *stork, Frog *frog){
+    if(stork->alive == true){
+        stork->x = rand() % (game_config->width / 2) + 1;
+        stork->y = rand() % (game_config->height / 2) + game_config->height / 2;
+        stork->delay = frog->jump_delay * 2;
+        stork->last_move_time = clock();
+        stork->dir_x = 1; 
+        stork->dir_y = 1;
+    }
+}
+//dir_x = -1; storks x position is decreasing
+//dir_x = 0; storks x position is not changing
+//dir_x = 1; storks x position is increasing
+//same with dir_y
+
+void check_whether_in_board(GameConfig *game_config, Stork *stork);
+void set_storks_direction(Stork *stork, Frog *frog);
+
+void move_stork(GameConfig *game_config, Stork *stork, Frog *frog) {
+    if(stork->alive == true){
+        if ((clock() - stork->last_move_time) * 1000 / CLOCKS_PER_SEC < stork->delay) {
+            return; 
+        }
+        if(frog->frogs_car == NULL){
+            set_storks_direction(stork, frog);
+
+            stork->x += stork->dir_x;
+            stork->y += stork->dir_y;
+
+            check_whether_in_board(game_config, stork);
+            stork->last_move_time = clock();
+        }
+    }
+}
+
+void set_storks_direction(Stork *stork, Frog *frog){
+    if (frog->x > stork->x) {
+        stork->dir_x = 1;
+    } else if (frog->x < stork->x) {
+        stork->dir_x = -1;
+    } else {
+        stork->dir_x = 0;
+    }
+
+    if (frog->y > stork->y) {
+        stork->dir_y = 1;
+    } else if (frog->y < stork->y) {
+        stork->dir_y = -1;
+    } else {
+        stork->dir_y = 0;
+    }
+}
+
+bool check_stork_collision(Frog *frog, Stork *stork) {
+    if((frog->x == stork->x || frog->x + 1 == stork->x )&& frog->y == stork->y){
+        return true;
+    }
+    else{
+        return false;
+    }
+}
+
+void check_whether_in_board(GameConfig *game_config, Stork *stork){
+    if (stork->x <= 1) stork->x = 1;
+    if (stork->x >= game_config->width) stork->x = game_config->width;
+    if (stork->y <= 1) stork->y = 1;
+    if (stork->y >= game_config->height) stork->y = game_config->height;
+}
+
+
+// INITIALIZING THE FROG
 void init_frog(GameConfig* game_config, Frog* frog) {
     frog->x = game_config->width / 2 + 1;
     frog->y = game_config->height;
@@ -151,6 +332,8 @@ void init_frog(GameConfig* game_config, Frog* frog) {
     frog->moves = 0;
     frog->last_jump_time = clock();
     frog->is_carried = false;
+    frog->score = 0;
+    frog->frogs_car = NULL;
 }
 
 // INITIALIZING AND RANDOMIZING CARS
@@ -179,16 +362,16 @@ void change_car_position(Car* car, GameConfig* game_config, int roads_pos[], int
     cars_on_lane[lane]++;
 }
 
-void set_cars_type(Car *car){
-    int temp = rand() % 10;
-        if(temp < 6){
-            car->car_type = 'h';
+void set_cars_type(Car *car, GameConfig *game_config){
+    int temp = ((rand() % 100) * 7937) % 100;
+        if(temp < game_config->f_car_chance){
+            car->car_type = 'f';
         }
-        else if(temp < 8){
+        else if(temp < (game_config->f_car_chance + game_config->n_car_chance)){
             car->car_type = 'n';
         }
-        else if(temp < 10){
-            car->car_type = 'f';
+        else{
+            car->car_type = 'h';
         }
 }
 void init_cars(Car *cars, GameConfig *game_config, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]){
@@ -199,7 +382,7 @@ void init_cars(Car *cars, GameConfig *game_config, int roads_pos[], int cars_on_
         cars[i].hidden = false;
         cars[i].hidden_until = 0;
         cars[i].until_delay_change = ((rand() % DELAY_CHANGE_T) + DELAY_CHANGE_T) * CLOCKS_PER_SEC / 1000;
-        set_cars_type(&cars[i]);
+        set_cars_type(&cars[i], game_config);
         cars[i].carrying_frog = false;
 
         change_car_position(&cars[i], game_config, roads_pos, cars_on_lane, free_lanes, lane_directions);
@@ -208,7 +391,7 @@ void init_cars(Car *cars, GameConfig *game_config, int roads_pos[], int cars_on_
 
 //INITIALIZING THE GAME
 
-bool start_game(GameConfig* game_config, Frog* frog) {
+bool start_game() {
     initscr();             
     cbreak();              
     noecho();               
@@ -226,16 +409,12 @@ bool start_game(GameConfig* game_config, Frog* frog) {
     init_pair(6, 10, 21);                       //obstacles
     init_pair(7, COLOR_BLACK, 14);              //neutral cars
     init_pair(8, COLOR_YELLOW, 11);             //friendly cars
-
-    strcpy(game_config->file_name,"config.txt");
-    if (read_config(game_config, frog) == false) {
-        return false;
-    }
+    init_pair(9, COLOR_BLACK, COLOR_WHITE);       //stork
 
     return true;
 }
 
-// DRAWING SECTION - STATUS, BOARD, FROG, CARS
+// DRAWING SECTION - STATUS, BOARD, FROG, CARS, STORK
 
 void draw_status(GameConfig* game_config, Frog* frog, int time_elapsed) {
     attron(COLOR_PAIR(4));
@@ -358,6 +537,17 @@ void draw_cars(WINDOW *game_window, Car *cars, GameConfig *game_config){
         }
     }
 }
+
+        //STORK DRAWING SECTION
+void draw_stork(WINDOW *game_window, Stork *stork){
+    if(stork->alive == true){
+        wattron(game_window, COLOR_PAIR(9));
+        mvwprintw(game_window, stork->y, stork->x, "V");
+        mvwprintw(game_window, stork->y - 1, stork->x - 1, "\\ /"); 
+        wattroff(game_window, COLOR_PAIR(9));
+    }
+}
+
 
 // MOVEMENT SECTION OF FROG AND CARS
 
@@ -575,7 +765,30 @@ bool cars_friendly_and_neutral_move(GameConfig *game_config, Frog *frog, Car *ca
     return true;
 }
 
-void update_car_pos(GameConfig *game_config, Car *car, Frog *frog, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]){
+bool is_shant(GameConfig *game_config, Car *car, Car *cars){
+    int car_i_pos = 0;
+    for(int i = 0; i < game_config->car_number; i++){
+        if(&cars[i] == car){
+            car_i_pos = i;
+        }
+    }
+
+    for(int i = 0; i < game_config->car_number; i++){
+        if(i != car_i_pos){
+            if (cars[i].y == car->y) { 
+                if (car->direction == 1 && cars[i].x > car->x && cars[i].x - car->x <= CAR_WIDTH) {
+                    return true;
+                } 
+                else if (car->direction == -1 && cars[i].x < car->x && car->x - cars[i].x <= CAR_WIDTH) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void update_car_pos(GameConfig *game_config, Car *car, Car *cars, Frog *frog, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]){
                                         //checks whether car should be shown
     if(car_visibility_check(game_config, car, roads_pos, cars_on_lane, free_lanes, lane_directions) == false){
         return;
@@ -585,6 +798,10 @@ void update_car_pos(GameConfig *game_config, Car *car, Frog *frog, int roads_pos
         //if(cars_friendly_and_neutral_move(game_config, frog, car) == false){
         return;
         //}
+    }
+
+    if(is_shant(game_config, car, cars) == true){ //if a car would ride "into" a car that is ahead of it then stop its movement
+        return;
     }
 
     if(car->carrying_frog == false){
@@ -616,7 +833,7 @@ void cars_move(GameConfig *game_config, Car* cars, Frog* frog, int roads_pos[], 
     for(int i = 0; i < game_config->car_number; i++){
         if((clock() - cars[i].last_move_time) * 1000 / CLOCKS_PER_SEC >= cars[i].delay){
             //updates cars position on the board
-            update_car_pos(game_config, &cars[i], frog, roads_pos, cars_on_lane, free_lanes, lane_directions);
+            update_car_pos(game_config, &cars[i], cars, frog, roads_pos, cars_on_lane, free_lanes, lane_directions);
             cars[i].last_move_time = clock();
 
             //checks whether enought time has passed for car to have another delay (meaning another speed)
@@ -662,11 +879,16 @@ bool check_collision(Frog *frog, Car *cars, GameConfig *game_config){
     return false;
 }
 
-char check_game_status(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car* cars) {           //n - nothing's changed; l - game lost; w - game won
+char check_game_status(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car* cars, Stork *stork, int time_elapsed) {           //n - nothing's changed; l - game lost; w - game won
     if (frog->y == 1) {
         mvwprintw(game_window, game_config->height / 2, game_config->width / 2 - 5, "YOU WON!");
         wrefresh(game_window);
-        delay(2000);
+        calculate_score(time_elapsed, frog);
+
+        char name[MAX_NUM];
+        get_player_name(frog, name); 
+        save_score(name, frog->score);   
+        delay(1000);
         return 'w';
     }
     if(check_collision(frog, cars, game_config) == true){
@@ -675,6 +897,12 @@ char check_game_status(WINDOW* game_window, GameConfig* game_config, Frog* frog,
         delay(2000);
         return 'c';
     }
+    if (check_stork_collision(frog, stork)) {
+        mvwprintw(game_window, game_config->height / 2, game_config->width / 2 - 11, "GAME OVER!\tSTORK GOT YOU!");
+        wrefresh(game_window);
+        delay(2000);
+    return false; // Gra kończy się
+}
     return 'n';
 }
 
@@ -700,28 +928,29 @@ void frog_gets_in_the_car(GameConfig *game_config, Frog *frog, Car *friendly_car
         frog->is_carried = true;
         frog->x = game_config->width / 2;
         frog->y = game_config->height + 1;
+        frog->frogs_car = friendly_car;
     }
     else{
         return;
     }
 }
 
-void frog_gets_out_of_the_car(GameConfig *game_config, Frog *frog, Car **frogs_car){
-    if(*frogs_car != NULL){
-        (*frogs_car)->carrying_frog = false;
+void frog_gets_out_of_the_car(GameConfig *game_config, Frog *frog){
+    if(frog->frogs_car != NULL){
+        frog->frogs_car->carrying_frog = false;
         frog->is_carried = false;
-        if((*frogs_car)->direction == 1){
-            frog->x = (*frogs_car)->x - 1;
+        if(frog->frogs_car->direction == 1){
+            frog->x = frog->frogs_car->x - 1;
         }
         else{
-            frog->x = (*frogs_car)->x + CAR_WIDTH + 1;
+            frog->x = frog->frogs_car->x + CAR_WIDTH + 1;
         }
-        frog->y = (*frogs_car)->y;
+        frog->y = frog->frogs_car->y;
         frog->is_invincible = true;
         frog->invincibility_start = clock();
 
         
-        *frogs_car = NULL;
+        frog->frogs_car = NULL;
         return;
     }
     else{
@@ -729,7 +958,7 @@ void frog_gets_out_of_the_car(GameConfig *game_config, Frog *frog, Car **frogs_c
     }
 }
 
-bool game_update(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *cars, Car** frogs_car, clock_t start_time, int time_elapsed, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]){
+bool game_update(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *cars, Stork* stork, clock_t start_time, int time_elapsed, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]){
     Car *friendly_car = find_near_friendly_car(game_config, frog, cars);        //if there is a friendly car in proximity of the frog then it is being saved into this variable
 
     int movement = getch();
@@ -738,16 +967,17 @@ bool game_update(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *
     }
     else if (movement == 'i' && frog->is_carried == false){
         frog_gets_in_the_car(game_config, frog, friendly_car);
-        *frogs_car = friendly_car;
+        frog->frogs_car = friendly_car;
     }
     else if(movement == 'o'){
-        frog_gets_out_of_the_car(game_config, frog, frogs_car);
+        frog_gets_out_of_the_car(game_config, frog);
     }
     else{
         frogs_move(game_config, frog, movement);
     }
     
     cars_move(game_config, cars, frog, roads_pos, cars_on_lane, free_lanes, lane_directions);
+    move_stork(game_config, stork, frog);
     update_invincibility(frog);
 
                         //drawing
@@ -758,17 +988,18 @@ bool game_update(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *
     }
     draw_cars(game_window, cars, game_config);
     draw_status(game_config, frog, time_elapsed);
+    draw_stork(game_window, stork);
     return true;
 }
 
-char game_play(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *cars, Car** frogs_car, clock_t start_time, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]) {
+char game_play(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *cars, Car** frogs_car, Stork *stork, clock_t start_time, int roads_pos[], int cars_on_lane[], int *free_lanes, int lane_directions[]) {
     for (;;) {
         int time_elapsed = (clock() - start_time) / CLOCKS_PER_SEC;             //counting past time
-        if(game_update(game_window, game_config, frog, cars, frogs_car, start_time, time_elapsed, roads_pos, cars_on_lane, free_lanes, lane_directions) == false){
+        if(game_update(game_window, game_config, frog, cars, stork, start_time, time_elapsed, roads_pos, cars_on_lane, free_lanes, lane_directions) == false){
             return false;
         }
 
-        if (check_game_status(game_window, game_config, frog, cars) != 'n') { //if game is won or lost, the function has to be finished executing
+        if (check_game_status(game_window, game_config, frog, cars, stork, time_elapsed) != 'n') { //if game is won or lost, the function has to be finished executing
             return false;
         }
 
@@ -781,7 +1012,9 @@ char game_play(WINDOW* game_window, GameConfig* game_config, Frog* frog, Car *ca
 
 bool initialize_game(GameConfig* game_config, Frog* frog) {
     game_config->car_number = 1;
-    if (!start_game(game_config, frog)) {
+    game_config->f_car_chance = 0;
+    game_config->n_car_chance = 0;
+    if (!start_game()) {
         return false;
     }
     return true;
@@ -819,23 +1052,109 @@ int* setup_lane_directions(GameConfig* game_config) {
     return lane_directions;
 }
 
-void cleanup_game(Frog* frog, GameConfig* game_config, Car* cars, int* cars_on_lane, int* lane_directions) {
+void cleanup_game(Frog* frog, Car* cars, Stork *stork, int* cars_on_lane, int* lane_directions) {
     delete frog;
-    delete game_config;
     delete[] cars;
     delete[] cars_on_lane;
     delete[] lane_directions;
+    delete[] stork;
     endwin();
 }
 
 //CREATING THE MENU PAGE
 
-int main() {
-    Frog* frog = new Frog;
-    GameConfig* game_config = new GameConfig;
-    game_config->car_number = 1;
+void display_menu() {
+    clear();
+    mvprintw(5, 10, "___=== Game Menu ===___");
+    mvprintw(6, 10, "1. Start Game");
+    mvprintw(7, 10, "2. Show Leaderboard");
+    mvprintw(8, 10, "3. Game Rules");
+    mvprintw(9, 10, "4. Exit");
+    mvprintw(11, 10, "Choose an option from 1 to 4:");
+    refresh();
+}
 
-    if (start_game(game_config, frog) == false) {
+void show_levels() {
+    clear();
+    mvprintw(5, 10, "___=== Select Difficulty ===___");
+    mvprintw(6, 10, "1. Easy level");
+    mvprintw(7, 10, "2. Medium level");
+    mvprintw(8, 10, "3. Difficult level");
+    mvprintw(10, 10, "Choose an option from 1 to 3:");
+    refresh();
+}
+
+bool handle_level_choice(int choice, char config_file_name[]) {
+    switch (choice) {
+        case 1: // Name of the easy level config file
+            strcpy(config_file_name, "config_easy.txt");
+            return true;
+        case 2: // -=- medium
+            strcpy(config_file_name, "config_medium.txt");
+            return true;
+        case 3: // -=- difficult
+            strcpy(config_file_name, "config_difficult.txt");
+            return true;
+        default:
+            return false;
+            refresh();
+            getch();
+    }
+    return false;
+}
+
+void print_game_rules(){
+    clear();
+    mvprintw(5, 10, "___=== Game Rules ===___");
+    mvprintw(6, 10, "1) Move with arrows;");
+    mvprintw(7, 10, "2) Red cars are hostile ones;");
+    mvprintw(8, 10, "3) Yellow cars are neutral, they will wait for you to pass them by;");
+    mvprintw(9, 10, "4) Same with blue cars, but they can also take you to another place");
+    mvprintw(10, 10, "\t4.1) If you want to hop into a car you need to press 'i'");
+    mvprintw(11, 10, "\t\ton your keyboard when you are close to them. Your car turns green.");
+    mvprintw(12, 10, "\t4.2) In order to get out of the car you need to press 'o';");
+    mvprintw(13, 10, "5) If you want to quit the game press 'q'.");
+    mvprintw(15, 10, "Press anything to get back to the main menu.");
+    refresh();
+}
+char handle_menu_choice(int choice, char config_file_name[]) { 
+    switch (choice) {
+        case 1: {
+            int level_choice;
+            show_levels();
+            level_choice = getch() - '0';
+            if (handle_level_choice(level_choice, config_file_name) == true) {
+                return 's';
+            }
+            break;
+        }
+        case 2:
+            clear();
+            show_ranking();
+            refresh();
+            getch();
+            break;
+        case 3:
+            print_game_rules();
+            getch();
+            break;
+        case 4:
+            return 'e';
+        default:
+            mvprintw(12, 10, "Invalid choice, pick a number from 1 to 4.");
+            refresh();
+            getch();
+    }
+    return 'n';
+}
+
+int play(GameConfig *game_config) {
+    Frog* frog = new Frog;
+    Stork *stork = new Stork;
+    game_config->car_number = 1;
+    stork->alive = false;
+
+    if (read_config(game_config, frog, stork) == false) {
         return 0;
     }
 
@@ -850,14 +1169,43 @@ int main() {
     Car *frogs_car = NULL;
     init_frog(game_config, frog);
     init_cars(cars, game_config, roads_pos, cars_on_lane, &free_lanes, lane_directions);
+    init_stork(game_config, stork, frog);
 
     clock_t start_time = clock(); //Time of the beginning of the game
     clock_t last_move_time = clock();
     WINDOW* game_window = newwin(game_config->height + 2, game_config->width + 2, 0, 0); 
 
-    if (game_play(game_window, game_config, frog, cars, &frogs_car, start_time, roads_pos, cars_on_lane, &free_lanes, lane_directions) == false) {
-        cleanup_game(frog, game_config, cars, cars_on_lane, lane_directions);    
-        return 0;
+    if (game_play(game_window, game_config, frog, cars, &frogs_car, stork, start_time, roads_pos, cars_on_lane, &free_lanes, lane_directions) == false) {
+        cleanup_game(frog, cars, stork, cars_on_lane, lane_directions);    
     }
-   
+    return 1;
+}
+
+int main() {
+    start_game(); //getting pdcurses to work
+
+    GameConfig *game_config = new GameConfig;
+    char config_file_name[MAX_NUM];
+
+    nodelay(stdscr, FALSE); //getch waits for the users input
+    while (true) {
+        display_menu();
+        int choice = getch() - '0';
+        char action = handle_menu_choice(choice, config_file_name);
+        if (action == 'e') {
+            delete game_config;
+            break;
+        }
+        else if(action == 's'){
+            nodelay(stdscr, TRUE); //now the program works without the need of intervention from the player 
+            strcpy(game_config->file_name, config_file_name);
+            if(play(game_config) == 0){
+                std::cerr << "Somethings wrong with the given data in the config file.";
+            }
+            nodelay(stdscr, FALSE); //again, now program waits for the users input
+        }
+    }
+
+    endwin();
+    return 0;
 }
